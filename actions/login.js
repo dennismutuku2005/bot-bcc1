@@ -1,19 +1,23 @@
 const { delay, typeLikeHuman } = require('../utils/humanActions');
 
 const login = async (page, phoneNumber, password) => {
-    console.log('Navigating to login page...');
+    console.log('Navigating to Betika...');
     await page.goto('https://www.betika.com/en-ke/login?next=%2F', { waitUntil: 'networkidle2' });
-    
-    // The user provided the HTML snippet, the phone number input has name='phone-number' or we can use CSS classes.
-    // .session__form__phone input or input[name="phone-number"]
     
     const phoneInputSelector = 'input[name="phone-number"]';
     const passwordInputSelector = 'input[name="password"]';
-    // Using the specific class from the user's HTML payload
     const loginButtonSelector = '.session__form__button.login';
 
-    console.log('Waiting for login form...');
-    await page.waitForSelector(phoneInputSelector);
+    console.log('Checking if login form is present...');
+    
+    try {
+        await page.waitForSelector(phoneInputSelector, { timeout: 5000 });
+    } catch (e) {
+        console.log('Login form not found. Assuming we are already logged in via active session cookies.');
+        return false; // Did not perform a new login
+    }
+
+    console.log('Login form found. Typing credentials...');
     await delay(1000, 2000); // Wait a bit before starting to type
 
     console.log('Typing phone number...');
@@ -34,7 +38,8 @@ const login = async (page, phoneNumber, password) => {
     await page.click(loginButtonSelector);
     
     console.log('Login action initiated.');
-    // Let it resolve so main.js can handle what to do next
+    // Let it resolve so main.js can handle the delay before fetching cookies
+    return true; // Performed a new login
 };
 
 module.exports = { login };
