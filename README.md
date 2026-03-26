@@ -18,25 +18,6 @@ This bot has been customized to simulate realistic, human-like activity includin
 - **Proxy Support:** Supports custom proxy assignments (`PROXY_URL`) for an added layer of geographic/request security.
 - **Automated Navigation:** Zero-click necessary workflow. Starts from Login into Crash Games and Comet Crush.
 
-## Setup Instructions
-
-1. **Install Dependencies:**
-   ```bash
-   npm install
-   ```
-
-2. **Configure Environment:**
-   Make sure you have a `.env` file in the root directory. Configure your variables:
-   ```env
-   PHONE_NUMBER=0793527494
-   PASSWORD=443JNZ
-   PROXY_URL= # (Optional: Provide formatted proxy proxy.example:port)
-   ```
-
-3. **Run the Bot:**
-   ```bash
-   node main.js
-   ```
 
 ## Disclaimer
 Note: The use of automated scripts on gambling and game sites often contravenes their explicit Terms of Service. This script is intended purely as a programming exercise.
