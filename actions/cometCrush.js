@@ -46,17 +46,293 @@ const openCometCrush = async (page) => {
     
     try {
         await page.goto(gameUrl, { waitUntil: 'networkidle2' });
-        console.log('Successfully loaded Comet Crush game canvas.');
+        console.log('Successfully loaded Comet Crush game wrapper.');
     } catch (e) {
         console.error('Failed to load the Comet Crush direct URL:', e);
     }
 
+    // --- DIRECT OPTIMIZATION ---
+    // Extract the Token URL from the iframe and navigate the main page to it.
+    console.log('Searching for the internal game engine URL...');
+    let directGameUrl = null;
+    const maxIframeRetries = 10;
+    
+    for (let i = 1; i <= maxIframeRetries; i++) {
+        const frames = page.frames();
+        const gameFrame = frames.find(f => f.url().includes('splitthepot.games') && f.url().includes('token='));
+        
+        if (gameFrame) {
+            directGameUrl = gameFrame.url();
+            console.log(`[HIJACK] Game token found on attempt ${i}`);
+            break;
+        }
+        console.log(`Waiting for game engine to spin up... (${i}/${maxIframeRetries})`);
+        await delay(1500, 2000);
+    }
+
+    if (directGameUrl) {
+        console.log('Leaving Betika wrapper. Navigating directly to Splitthepot engine...');
+        try {
+            await page.goto(directGameUrl, { waitUntil: 'networkidle2' });
+            console.log('Direct navigation successful. We are now "Inside" the game.');
+        } catch (e) {
+            console.error('Failed to navigate to direct game URL:', e.message);
+        }
+    } else {
+        console.warn('Could not extract direct game URL. Staying in iframe mode.');
+    }
+    // ----------------------------
+
     // Clean up the listener so it doesn't leak memory or trigger unexpectedly later
     page.off('dialog', dialogHandler);
 
-    // Wait for the iframe or canvas game engine to initialize
-    await delay(4000, 6000);
-    console.log('Comet Crush module finished loading.');
+    // Wait for the engine on the new page to initialize
+    await delay(3000, 5000);
+    
+    // Clear the blocking onboarding UI (now on the direct page)
+    await removePopup(page);
 };
 
-module.exports = { navigateToCrashGames, openCometCrush };
+const { logBurst, logPacket, logToLoggerJson, logRawCrash } = require('../utils/logger');
+
+const msgpack = require('@msgpack/msgpack');
+
+/**
+ * Intercepts WebSocket messages across ALL targets (main page + iframes).
+ * This ensures we capture the game socket even when it runs inside a nested iframe.
+ */
+const setupWebSocketInterception = async (page) => {
+    console.log('[SOCKET] Initializing Global Multi-Target Interceptor...');
+    const browser = page.browser();
+    const RECORD_SEPARATOR = 0x1e;
+
+    // Track sessions to avoid duplicate listeners
+    const activeSessions = new Set();
+
+    /**
+     * Decodes a SignalR VarInt length prefix.
+     */
+    const readVarInt = (buffer, offset) => {
+        let value = 0;
+        let shift = 0;
+        let i = offset;
+        while (i < buffer.length) {
+            const byte = buffer[i++];
+            value |= (byte & 0x7f) << shift;
+            if ((byte & 0x80) === 0) break;
+            shift += 7;
+        }
+        return { value, consumed: i - offset };
+    };
+
+    let lastRecordedVal = null; 
+    const recordedRounds = new Set();
+
+    const processSignalRMessage = (msg, format, targetUrl) => {
+        try {
+            let decoded;
+            if (format === 'JSON') {
+                const text = msg.toString('utf8');
+                if (!text.startsWith('{')) return;
+                decoded = JSON.parse(text);
+            } else {
+                try {
+                    decoded = msgpack.decode(msg);
+                } catch (e) { return; }
+            }
+            
+            lastTickTime = Date.now();
+            const type = decoded[3] || (decoded.type === 1 ? decoded.target : null);
+            const payload = decoded[4] || decoded.arguments;
+            if (!type || !payload) return;
+
+            // 1. TICKER (Console visibility only)
+            if (type === 'c' && payload[0]) {
+                const arg = payload[0];
+                const multiplier = arg[6];
+                if (typeof multiplier === 'number' && arg[3] === 3) {
+                    process.stdout.write(`\r[FLYING] Game: ${arg[1]} | ${multiplier}x              `);
+                }
+            }
+
+            // 2. THE MASTER TRUTH (history/recentCrashes)
+            // This is the ONLY place we log to the file to guarantee precision and 1x record per round
+            if (['history', 'recentCrashes', 'latestBets'].includes(type)) {
+                const data = payload[0];
+                const items = Array.isArray(data) ? data : (data.history || []);
+                if (items.length > 0) {
+                    const latest = items[0];
+                    const val = (typeof latest === 'object') ? (latest.m || latest.multiplier) : latest;
+                    
+                    if (val && val !== lastRecordedVal) {
+                        process.stdout.write('\n');
+                        logBurst({
+                            gameId: (typeof latest === 'object' ? (latest.i || latest.id) : "HISTORY"),
+                            crashAt: parseFloat(val),
+                            time: new Date().toISOString()
+                        });
+                        console.log(`[RECORD] Captured Burst: ${val}x`);
+                        lastRecordedVal = val;
+                    }
+                }
+            }
+        } catch (e) { }
+    };
+
+
+
+    const attachToTarget = async (target) => {
+        const targetId = target._targetId;
+        if (activeSessions.has(targetId)) return;
+        
+        const type = target.type();
+        if (type !== 'page' && type !== 'iframe' && type !== 'other') return;
+
+        try {
+            const client = await target.createCDPSession();
+            activeSessions.add(targetId);
+            
+            await client.send('Network.enable');
+            await client.send('Page.enable');
+
+            client.on('Network.webSocketFrameReceived', ({ response }) => {
+                const buffer = Buffer.from(response.payloadData, 'base64');
+                try {
+                    if (buffer.includes(RECORD_SEPARATOR)) {
+                        let start = 0;
+                        for (let i = 0; i < buffer.length; i++) {
+                            if (buffer[i] === RECORD_SEPARATOR) {
+                                const msg = buffer.slice(start, i);
+                                if (msg.length > 0) processSignalRMessage(msg, 'JSON', target.url());
+                                start = i + 1;
+                            }
+                        }
+                    } else {
+                        let offset = 0;
+                        while (offset < buffer.length) {
+                            try {
+                                const { value: len, consumed } = readVarInt(buffer, offset);
+                                offset += consumed;
+                                if (len > 0 && offset + len <= buffer.length) {
+                                    processSignalRMessage(buffer.slice(offset, offset + len), 'MSGPACK', target.url());
+                                    offset += len;
+                                } else if (len === 0) {
+                                    offset++;
+                                } else { break; }
+                            } catch (e) { break; }
+                        }
+                    }
+                } catch (e) {}
+            });
+        } catch (err) {}
+    };
+
+    // Watchdog
+    setInterval(async () => {
+        try {
+            const idleTime = (Date.now() - lastTickTime) / 1000;
+            if (idleTime > 30) {
+                console.log(`\n[WATCHDOG] Silent for ${idleTime.toFixed(0)}s. Sniffing all frames...`);
+                activeSessions.clear(); 
+                const currentTargets = browser.targets();
+                for (const t of currentTargets) {
+                    if (t.type() === 'page' || t.type() === 'iframe') await attachToTarget(t);
+                }
+                if (idleTime > 120) {
+                    console.log(`[WATCHDOG] CRITICAL SILENCE. Refreshing...`);
+                    await page.reload({ waitUntil: 'networkidle2' }).catch(() => {});
+                    lastTickTime = Date.now();
+                }
+            }
+        } catch (e) {}
+    }, 15000);
+
+    browser.on('targetdestroyed', (t) => activeSessions.delete(t._id || t._targetId));
+    browser.on('targetcreated', attachToTarget);
+
+    await attachToTarget(page.target());
+    const initialTargets = browser.targets();
+    for (const t of initialTargets) await attachToTarget(t);
+
+    console.log('[SOCKET] Global interceptor active. Sniffing for precision bursts...');
+};
+
+const removePopup = async (page) => {
+    console.log('Checking for onboarding popup in all frames...');
+    
+    // We'll retry a few times as the popup might load slightly after the initial page load
+    const maxRetries = 5;
+    for (let retry = 1; retry <= maxRetries; retry++) {
+        try {
+            const frames = page.frames();
+            console.log(`Scanning ${frames.length} frames (Attempt ${retry}/${maxRetries})...`);
+
+            for (const frame of frames) {
+                // Check if this frame has the popup text
+                const hasPopupText = await frame.evaluate(() => {
+                    const text = document.body.innerText;
+                    return text.includes('space suits') || text.includes('astronauts') || text.includes('cosmic gamble');
+                });
+
+                if (hasPopupText) {
+                    console.log(`Onboarding popup text detected in frame: ${frame.url()}`);
+                    
+                    const clicked = await frame.evaluate(() => {
+                        const selectors = [
+                            'button[stptrack="onboarding-close-on-welcome"]',
+                            '.onboarding-popup-container button',
+                            'button.mdc-button--unelevated .mdc-button__label', // Matches the "Close" button structure
+                            'button:has(.mdc-button__label)',
+                            '.onboarding-popup-controls button'
+                        ];
+
+                        for (const selector of selectors) {
+                            const btns = Array.from(document.querySelectorAll(selector));
+                            const closeBtn = btns.find(b => b.innerText.toLowerCase().includes('close') || b.innerText.toLowerCase().includes('skip'));
+                            
+                            if (closeBtn && closeBtn.offsetParent !== null) {
+                                closeBtn.click();
+                                return `Clicked button matching ${selector} with text ${closeBtn.innerText}`;
+                            }
+                            
+                            // Try clicking the first button in the selector list if no text match
+                            const firstBtn = document.querySelector(selector);
+                            if (firstBtn && firstBtn.offsetParent !== null) {
+                                firstBtn.click();
+                                return `Clicked first button matching ${selector}`;
+                            }
+                        }
+
+                        // Broadest fallback: any button containing "Close"
+                        const allButtons = Array.from(document.querySelectorAll('button'));
+                        const fallbackBtn = allButtons.find(b => 
+                            (b.innerText.toLowerCase().includes('close') || b.innerText.toLowerCase().includes('skip')) 
+                            && b.offsetParent !== null
+                        );
+
+                        if (fallbackBtn) {
+                            fallbackBtn.click();
+                            return `Clicked fallback button containing 'Close'`;
+                        }
+
+                        return null;
+                    });
+
+                    if (clicked) {
+                        console.log('Successfully closed popup:', clicked);
+                        return; // Done
+                    }
+                }
+            }
+            
+            // If not found, wait a bit before retrying
+            await delay(2000, 3000);
+        } catch (e) {
+            console.log(`Error during frame scan (Attempt ${retry}):`, e.message);
+        }
+    }
+    
+    console.log('Could not find or close the onboarding popup after several attempts.');
+};
+
+module.exports = { navigateToCrashGames, openCometCrush, removePopup, setupWebSocketInterception };
