@@ -4,7 +4,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 
 const { login } = require('./actions/login');
-const { navigateToCrashGames, openCometCrush } = require('./actions/cometCrush');
+const { navigateToCrashGames, openCometCrush, setupWebSocketInterception } = require('./actions/cometCrush');
 const { saveSession, loadSession } = require('./utils/session');
 const { delay } = require('./utils/humanActions');
 
@@ -28,6 +28,12 @@ const { delay } = require('./utils/humanActions');
         
         // Set a realistic user agent
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36');
+        
+        // --- START INTERCEPTING IMMEDIATELY ---
+        // This will capture login, navigation, and game traffic in logger.json
+        await setupWebSocketInterception(page);
+        console.log('[MONITOR] Ready: Capturing all WebSocket traffic starting now...');
+        // --------------------------------------
         
         // Credentials from .env
         const myPhoneNumber = process.env.PHONE_NUMBER;
@@ -59,14 +65,15 @@ const { delay } = require('./utils/humanActions');
         // Navigate to Comet Crush
         await openCometCrush(page);
         
-        console.log('Testing completed successfully. Waiting 10 seconds before closing...');
+        console.log('Bot has reached its destination. Continuous monitoring is active...');
+        
+        // Keep the process alive indefinitely to continue monitoring
+        await new Promise(() => {}); 
+        
     } catch (error) {
-        console.error('An error occurred during testing:', error);
+        console.error('An error occurred:', error);
     } finally {
-        // Leave the browser open for 10 seconds after completion or failure 
-        // to let the user see the result of the login attempt.
-        await delay(10000, 10000); // 10s wait
-        console.log('Closing browser...');
+        console.log('Finalizing...');
         await browser.close();
     }
 })();
