@@ -5,6 +5,7 @@ puppeteer.use(StealthPlugin());
 
 const { login } = require('./actions/login');
 const { navigateToCrashGames, openCometCrush } = require('./actions/cometCrush');
+const { saveSession, loadSession } = require('./utils/session');
 const { delay } = require('./utils/humanActions');
 
 (async () => {
@@ -36,13 +37,21 @@ const { delay } = require('./utils/humanActions');
             throw new Error('Please define PHONE_NUMBER and PASSWORD in your .env file');
         }
         
-        // Run modular login action
-        await login(page, myPhoneNumber, myPassword);
+        // Attempt to load previous session before logging in
+        await loadSession(page);
         
-        console.log('Login successful. Proceeding to Comet Crush navigation...');
+        // Run modular login action
+        const didNewLogin = await login(page, myPhoneNumber, myPassword);
+        
+        console.log('Login flow successful. Proceeding to Comet Crush navigation...');
         
         // Wait for page to reload or settle after login
         await delay(3000, 5000); 
+        
+        // If it was a new login, save the newly generated cookies
+        if (didNewLogin) {
+            await saveSession(page);
+        } 
         
         // Navigate to Crash Games
         await navigateToCrashGames(page);
