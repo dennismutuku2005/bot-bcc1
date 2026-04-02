@@ -1,4 +1,6 @@
 const { delay } = require('../utils/humanActions');
+const { saveGameUrl } = require('../utils/gameUrl');
+const { recordBet, resolveRound } = require('../utils/wallet');
 
 const navigateToCrashGames = async (page) => {
     console.log('Waiting for Crash Games menu item...');
@@ -75,6 +77,8 @@ const openCometCrush = async (page) => {
         try {
             await page.goto(directGameUrl, { waitUntil: 'networkidle2' });
             console.log('Direct navigation successful. We are now "Inside" the game.');
+            // Save the direct URL for future sessions
+            await saveGameUrl(directGameUrl);
         } catch (e) {
             console.error('Failed to navigate to direct game URL:', e.message);
         }
@@ -125,8 +129,81 @@ const setupWebSocketInterception = async (page) => {
         return { value, consumed: i - offset };
     };
 
-    let lastRecordedVal = null; 
-    const recordedRounds = new Set();
+    const config = require('../config');
+    let lastMultiplier = null;
+    let lastGameId = null;
+    let lastTickTime = Date.now();
+    let lastRecordedVal = null;
+    let canBetThisRound = false; // Start as false to wait for the next full round
+    const recordedGids = new Set(); 
+
+    const placeBets = async (page, gid) => {
+        const betToPlace = { stake: config.currentStake, autoCashout: config.cashout };
+        await recordBet(gid, [betToPlace]);
+
+        try {
+            const frames = page.frames();
+            for (const frame of frames) {
+                const bettingSections = await frame.$$('.settings-wrapper');
+                if (bettingSections.length >= 1) {
+                    const section = bettingSections[0]; // ONLY First Card
+                    
+                    await section.evaluate((el, s) => {
+                        const mainSwitch = el.querySelector('stp-switch input[role="switch"]');
+                        if (mainSwitch && mainSwitch.ariaChecked === 'false') {
+                            const label = mainSwitch.closest('.stp-switch-label');
+                            if (label) label.click();
+                        }
+
+                        const fieldToggle = el.querySelector('stp-toggle button');
+                        if (fieldToggle) {
+                            const handles = Array.from(fieldToggle.querySelectorAll('.handle'));
+                            const offHandleActive = handles.find(h => h.innerText.includes('OFF') && h.classList.contains('active'));
+                            if (offHandleActive) fieldToggle.click();
+                        }
+
+                        const stakeInput = el.querySelector('.stake-input input') || el.querySelector('#stake-input');
+                        const oddInput = el.querySelector('.input-container input') || el.querySelector('input[id^="mat-input-"]');
+
+                        const set = (input, val) => {
+                            if (!input) return;
+                            input.focus(); input.value = val;
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                            input.dispatchEvent(new Event('blur', { bubbles: true }));
+                        };
+
+                        set(stakeInput, s.stake);
+                        set(oddInput, s.autoCashout);
+                    }, betToPlace);
+
+                    await new Promise(r => setTimeout(r, 150));
+
+                    const status = await section.evaluate(async (el) => {
+                        const findBtn = () => Array.from(el.querySelectorAll('button')).find(b => {
+                            const t = b.innerText.toLowerCase();
+                            return t.includes('play') || t.includes('next') || t.includes('place');
+                        });
+                        for (let r = 0; r < 20; r++) {
+                            const btn = findBtn();
+                            if (btn && !btn.disabled && !btn.innerText.includes('Cancel')) {
+                                btn.click(); return "CLICKED";
+                            }
+                            if (btn && btn.innerText.includes('Cancel')) return "ALREADY_PLACED";
+                            await new Promise(res => setTimeout(res, 100));
+                        }
+                        return "TIMEOUT";
+                    });
+
+                    console.log(`[BETTING] ${status}: KES ${betToPlace.stake} @ ${betToPlace.autoCashout}x`);
+                    return true;
+                }
+            }
+        } catch (e) {
+            console.error('[BETTING] Error:', e.message);
+        }
+        return false;
+    };
 
     const processSignalRMessage = (msg, format, targetUrl) => {
         try {
@@ -146,37 +223,80 @@ const setupWebSocketInterception = async (page) => {
             const payload = decoded[4] || decoded.arguments;
             if (!type || !payload) return;
 
-            // 1. TICKER (Console visibility only)
+            // 1. TICKER & EMERGENCY FALLBACK
             if (type === 'c' && payload[0]) {
                 const arg = payload[0];
+                const gid = arg[1];
+                const state = arg[3]; 
                 const multiplier = arg[6];
-                if (typeof multiplier === 'number' && arg[3] === 3) {
-                    process.stdout.write(`\r[FLYING] Game: ${arg[1]} | ${multiplier}x              `);
+
+                // Check if we jumped to a new game
+                if (gid !== lastGameId) {
+                    if (lastGameId && !recordedGids.has(lastGameId) && lastMultiplier !== null) {
+                        triggerManualRecord(lastGameId, lastMultiplier, "Ticker Fallback");
+                    }
+                    recordedGids.delete(gid); 
+                    
+                    if (lastGameId === null) {
+                        console.log(`[BYPASS] Joined mid-game (ID: ${gid}). Waiting for next full round...`);
+                    } else {
+                        canBetThisRound = true; // Standard reset for new round
+                    }
+                    
+                    lastGameId = gid;
+                }
+
+                // Trigger betting immediately AFTER round starts (State 3: Flying)
+                // This ensures we are betting for the NEXT round as requested.
+                if (state === 3 && canBetThisRound) {
+                    canBetThisRound = false; 
+                    // 500ms delay to let UI switch to "Next Round" mode
+                    setTimeout(() => placeBets(page, gid), 500); 
+                }
+
+                if (typeof multiplier === 'number') {
+                    lastMultiplier = multiplier;
+                    if (state === 3) {
+                        process.stdout.write(`\r[FLYING] Game: ${gid} | ${multiplier}x              `);
+                    } else if ((state === 4 || state === 5) && !recordedGids.has(gid)) {
+                        triggerManualRecord(gid, multiplier, "Canonical State");
+                        // Clear console line and show round result
+                    }
                 }
             }
 
             // 2. THE MASTER TRUTH (history/recentCrashes)
-            // This is the ONLY place we log to the file to guarantee precision and 1x record per round
             if (['history', 'recentCrashes', 'latestBets'].includes(type)) {
                 const data = payload[0];
                 const items = Array.isArray(data) ? data : (data.history || []);
-                if (items.length > 0) {
-                    const latest = items[0];
-                    const val = (typeof latest === 'object') ? (latest.m || latest.multiplier) : latest;
+                for (const item of items) {
+                    const val = (typeof item === 'object') ? (item.m || item.multiplier) : item;
+                    const gid = (typeof item === 'object') ? (item.i || item.id) : null;
                     
-                    if (val && val !== lastRecordedVal) {
-                        process.stdout.write('\n');
-                        logBurst({
-                            gameId: (typeof latest === 'object' ? (latest.i || latest.id) : "HISTORY"),
-                            crashAt: parseFloat(val),
-                            time: new Date().toISOString()
-                        });
-                        console.log(`[RECORD] Captured Burst: ${val}x`);
-                        lastRecordedVal = val;
+                    // We generate a temp key if no UUID provided
+                    const key = gid || `val_${val}_${new Date().getMinutes()}`;
+                    
+                    if (val && !recordedGids.has(key)) {
+                        triggerManualRecord(key, val, "Server History");
                     }
                 }
             }
+
+            if (recordedGids.size > 500) recordedGids.clear();
         } catch (e) { }
+    };
+
+    const triggerManualRecord = (gid, val, source) => {
+        if (!gid || !val || recordedGids.has(gid)) return;
+        process.stdout.write('\n');
+        logBurst({
+            gameId: gid,
+            crashAt: parseFloat(val).toFixed(2),
+            time: new Date().toISOString()
+        });
+        console.log(`[RECORD] Burst Captured: ${val}x (${source})`);
+        resolveRound(gid, parseFloat(val));
+        recordedGids.add(gid);
     };
 
 
